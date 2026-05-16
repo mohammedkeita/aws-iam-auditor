@@ -65,11 +65,23 @@ pip install -r requirements.txt
 ### Run
 
 ```bash
-python auditor.py
+python auditor.py                       # default scan
+python auditor.py --verbose             # print each principal as it scans
+python auditor.py --skip-users          # roles only
+python auditor.py --output-dir custom/  # write report elsewhere
+python auditor.py --help                # see all options
 ```
 
-A timestamped report will be written to `reports/iam-audit-YYYY-MM-DD.md`.
+A timestamped report will be written to `reports/iam-audit-YYYY-MM-DD.md` by default.
 
+### Cleanup
+
+To tear down the deliberately misconfigured test resources:
+
+```bash
+python cleanup.py            # dry run — shows what would be deleted
+python cleanup.py --confirm  # actually delete
+```
 ---
 
 ## How It Works
@@ -105,11 +117,13 @@ This auditor supports assessment of the following controls:
 
 aws-iam-auditor/
 ├── auditor.py              # Main script: discovery, analysis, reporting
+├── cleanup.py              # Tears down the test environment
 ├── requirements.txt        # Python dependencies (boto3)
 ├── architecture.png        # Architecture diagram
-├── test-environment.md     # Documentation of intentionally vulnerable test resources
+├── test-environment.md     # Documentation of test resources
 ├── reports/                # Generated audit reports (Markdown)
 │   └── iam-audit-*.md
+├── LICENSE
 └── README.md
 
 ---

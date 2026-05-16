@@ -2,16 +2,27 @@
 AWS IAM Least-Privilege Auditor
 
 Scans AWS IAM users and roles for over-permissioned policies and generates
-a Markdown compliance report.
+a Markdown compliance report aligned to NIST 800-53 Rev. 5 controls.
+
+Usage:
+    python auditor.py                       # default scan
+    python auditor.py --output-dir custom   # write reports elsewhere
+    python auditor.py --skip-users          # only audit roles
+    python auditor.py --verbose             # show progress for each principal
 """
 
-import boto3
+import argparse
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
-# Sensitive actions that warrant extra scrutiny when paired with Resource: "*"
+
+# ---------- Configuration ----------
+
 PRIVILEGE_ESCALATION_ACTIONS = {
     'iam:passrole',
     'iam:createrole',
@@ -25,7 +36,6 @@ PRIVILEGE_ESCALATION_ACTIONS = {
 
 SEVERITY_ORDER = {'CRITICAL': 0, 'HIGH': 1, 'MEDIUM': 2, 'LOW': 3}
 
-# NIST 800-53 Rev. 5 controls this auditor helps assess
 NIST_CONTROLS = [
     ('AC-2',  'Account Management — identifies user/role inventory and policies'),
     ('AC-3',  'Access Enforcement — detects overly permissive Allow statements'),
@@ -69,29 +79,37 @@ def get_managed_policy_document(iam, policy_arn):
 
 def get_user_policies(iam, username):
     policies = []
-    for p in iam.list_attached_user_policies(UserName=username)['AttachedPolicies']:
-        policies.append({
-            'name': p['PolicyName'],
-            'type': 'managed',
-            'document': get_managed_policy_document(iam, p['PolicyArn']),
-        })
-    for name in iam.list_user_policies(UserName=username)['PolicyNames']:
-        doc = iam.get_user_policy(UserName=username, PolicyName=name)
-        policies.append({'name': name, 'type': 'inline', 'document': doc['PolicyDocument']})
+    try:
+        for p in iam.list_attached_user_policies(UserName=username)['AttachedPolicies']:
+            policies.append({
+                'name': p['PolicyName'],
+                'type': 'managed',
+                'document': get_managed_policy_document(iam, p['PolicyArn']),
+            })
+        for name in iam.list_user_policies(UserName=username)['PolicyNames']:
+            doc = iam.get_user_policy(UserName=username, PolicyName=name)
+            policies.append({'name': name, 'type': 'inline', 'document': doc['PolicyDocument']})
+    except ClientError as e:
+        print(f"  ! Could not retrieve all policies for user {username}: {e.response['Error']['Code']}",
+              file=sys.stderr)
     return policies
 
 
 def get_role_policies(iam, role_name):
     policies = []
-    for p in iam.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']:
-        policies.append({
-            'name': p['PolicyName'],
-            'type': 'managed',
-            'document': get_managed_policy_document(iam, p['PolicyArn']),
-        })
-    for name in iam.list_role_policies(RoleName=role_name)['PolicyNames']:
-        doc = iam.get_role_policy(RoleName=role_name, PolicyName=name)
-        policies.append({'name': name, 'type': 'inline', 'document': doc['PolicyDocument']})
+    try:
+        for p in iam.list_attached_role_policies(RoleName=role_name)['AttachedPolicies']:
+            policies.append({
+                'name': p['PolicyName'],
+                'type': 'managed',
+                'document': get_managed_policy_document(iam, p['PolicyArn']),
+            })
+        for name in iam.list_role_policies(RoleName=role_name)['PolicyNames']:
+            doc = iam.get_role_policy(RoleName=role_name, PolicyName=name)
+            policies.append({'name': name, 'type': 'inline', 'document': doc['PolicyDocument']})
+    except ClientError as e:
+        print(f"  ! Could not retrieve all policies for role {role_name}: {e.response['Error']['Code']}",
+              file=sys.stderr)
     return policies
 
 
@@ -158,18 +176,20 @@ def analyze_policy(policy):
 # ---------- Report building ----------
 
 def escape_md(text):
-    """Escape pipe characters so they don't break Markdown tables."""
-    return str(text).replace('|', '\\|')
+    """Escape characters that have special meaning in Markdown tables."""
+    return (
+        str(text)
+        .replace('\\', '\\\\')
+        .replace('|', '\\|')
+        .replace('*', '\\*')
+        .replace('_', '\\_')
+        .replace('`', '\\`')
+    )
 
 
 def build_report(account_id, scan_results):
-    """
-    Build the full Markdown report.
-    scan_results: list of dicts with keys 'type', 'name', 'findings'.
-    """
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-    # Count findings by severity
     severity_counts = Counter()
     for entry in scan_results:
         for f in entry['findings']:
@@ -193,7 +213,6 @@ def build_report(account_id, scan_results):
     lines.append('## Findings')
     lines.append('')
 
-    # Sort entries: those with findings first, then alphabetical
     sorted_entries = sorted(
         scan_results,
         key=lambda e: (len(e['findings']) == 0, e['type'], e['name']),
@@ -219,7 +238,6 @@ def build_report(account_id, scan_results):
             )
         lines.append('')
 
-    # NIST mapping footer
     lines.append('## NIST 800-53 Rev. 5 Control Mapping')
     lines.append('')
     lines.append('This audit supports assessment of the following controls:')
@@ -237,48 +255,90 @@ def build_report(account_id, scan_results):
 
 # ---------- Orchestration ----------
 
-def run_audit():
+def run_audit(skip_users=False, skip_roles=False, verbose=False):
     iam = get_iam_client()
     account_id = get_account_id()
     scan_results = []
 
-    for user in list_users(iam):
-        findings = []
-        for policy in get_user_policies(iam, user['UserName']):
-            findings.extend(analyze_policy(policy))
-        scan_results.append({'type': 'User', 'name': user['UserName'], 'findings': findings})
+    if not skip_users:
+        users = list_users(iam)
+        print(f"Scanning {len(users)} user(s)...")
+        for user in users:
+            if verbose:
+                print(f"  → {user['UserName']}")
+            findings = []
+            for policy in get_user_policies(iam, user['UserName']):
+                findings.extend(analyze_policy(policy))
+            scan_results.append({'type': 'User', 'name': user['UserName'], 'findings': findings})
 
-    for role in list_roles(iam):
-        findings = []
-        for policy in get_role_policies(iam, role['RoleName']):
-            findings.extend(analyze_policy(policy))
-        scan_results.append({'type': 'Role', 'name': role['RoleName'], 'findings': findings})
+    if not skip_roles:
+        roles = list_roles(iam)
+        print(f"Scanning {len(roles)} role(s)...")
+        for role in roles:
+            if verbose:
+                print(f"  → {role['RoleName']}")
+            findings = []
+            for policy in get_role_policies(iam, role['RoleName']):
+                findings.extend(analyze_policy(policy))
+            scan_results.append({'type': 'Role', 'name': role['RoleName'], 'findings': findings})
 
     return account_id, scan_results
 
 
-def save_report(report_text):
-    reports_dir = Path(__file__).parent / 'reports'
-    reports_dir.mkdir(exist_ok=True)
+def save_report(report_text, output_dir):
+    reports_dir = Path(output_dir)
+    reports_dir.mkdir(parents=True, exist_ok=True)
     filename = f"iam-audit-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.md"
     path = reports_dir / filename
     path.write_text(report_text)
     return path
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Audit AWS IAM users and roles for over-permissioned policies.',
+    )
+    parser.add_argument(
+        '--output-dir',
+        default='reports',
+        help='Directory where the report will be written (default: reports)',
+    )
+    parser.add_argument('--skip-users', action='store_true', help='Skip auditing IAM users')
+    parser.add_argument('--skip-roles', action='store_true', help='Skip auditing IAM roles')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Print each principal as it is scanned')
+    return parser.parse_args()
+
+
 def main():
-    print("Running IAM audit...")
-    account_id, scan_results = run_audit()
+    args = parse_args()
 
-    print("Building report...")
-    report = build_report(account_id, scan_results)
+    try:
+        print("Running IAM audit...")
+        account_id, scan_results = run_audit(
+            skip_users=args.skip_users,
+            skip_roles=args.skip_roles,
+            verbose=args.verbose,
+        )
 
-    path = save_report(report)
-    print(f"✓ Report saved to: {path}")
+        print("Building report...")
+        report = build_report(account_id, scan_results)
 
-    # Quick console summary
-    total = sum(len(e['findings']) for e in scan_results)
-    print(f"  Scanned {len(scan_results)} principal(s), found {total} issue(s)")
+        path = save_report(report, args.output_dir)
+        total = sum(len(e['findings']) for e in scan_results)
+        print(f"✓ Report saved to: {path}")
+        print(f"  Scanned {len(scan_results)} principal(s), found {total} issue(s)")
+
+    except NoCredentialsError:
+        print("ERROR: No AWS credentials found. Run `aws configure` first.", file=sys.stderr)
+        sys.exit(1)
+    except ClientError as e:
+        code = e.response['Error']['Code']
+        message = e.response['Error']['Message']
+        print(f"ERROR: AWS returned {code} — {message}", file=sys.stderr)
+        sys.exit(1)
+    except BotoCoreError as e:
+        print(f"ERROR: AWS SDK error — {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
